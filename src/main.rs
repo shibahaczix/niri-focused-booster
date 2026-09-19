@@ -4,8 +4,9 @@ mod x11;
 
 use dbus::*;
 use limits::*;
-use niri_ipc::state::{EventStreamStatePart, WindowsState};
-use niri_ipc::{Event, Request, socket::Socket};
+use niri_ipc::state::{EventStreamState, EventStreamStatePart};
+use niri_ipc::{Request, Window, socket::Socket};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,13 +14,52 @@ use std::sync::{Arc, Mutex};
 use x11::*;
 use zbus::blocking::Connection;
 
+/// Reads excluded app IDs from `NIRI_FOCUSED_BOOSTER_EXCLUDE` (comma-separated) and/or CLI args
+/// (also comma-separated, can be repeated). Matching is a case-insensitive substring match
+/// against the window's `app_id`, so e.g. "steam" also matches "steam_app_12345".
+fn load_exclusions() -> Vec<String> {
+    let mut exclusions: Vec<String> = std::env::args()
+        .skip(1)
+        .flat_map(|arg| arg.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .collect();
+
+    if let Ok(env_value) = std::env::var("NIRI_FOCUSED_BOOSTER_EXCLUDE") {
+        exclusions.extend(env_value.split(',').map(str::to_owned));
+    }
+
+    exclusions.into_iter().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
+}
+
+fn is_excluded(app_id: Option<&str>, exclusions: &[String]) -> bool {
+    let Some(app_id) = app_id else {
+        return false;
+    };
+
+    let app_id = app_id.to_lowercase();
+    exclusions.iter().any(|excluded| app_id.contains(excluded.as_str()))
+}
+
+/// PIDs of every window that should currently be boosted: fullscreen and not excluded.
+/// A `HashSet` because with multiple monitors more than one window can be fullscreen at once.
+fn compute_boost_pids(state: &EventStreamState, exclusions: &[String]) -> HashSet<i32> {
+    state
+        .windows
+        .windows
+        .values()
+        .filter(|window: &&Window| window.is_fullscreen)
+        .filter(|window| !is_excluded(window.app_id.as_deref(), exclusions))
+        .filter_map(|window| window.pid)
+        .collect()
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let boosted_limits =
         parse_limits_file(Path::new("/sys/fs/cgroup/dmem.capacity")).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "Failed to read /sys/fs/cgroup/dmem.capacity")
         })?;
-
     let non_boosted_limits: DmemLimit = boosted_limits.keys().map(|key| (key.clone(), 0)).collect();
+    let exclusions = load_exclusions();
+
     let mut event_socket = Socket::connect()?;
     let conn = Connection::session()?;
 
@@ -30,96 +70,102 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let focused_dmem_low_path_for_cleanup = Arc::new(Mutex::new(None::<PathBuf>));
-    let cleanup_focused_dmem_low_path = Arc::clone(&focused_dmem_low_path_for_cleanup);
-    let cleanup_non_boosted_limits = non_boosted_limits.clone();
+    // Currently-boosted windows, keyed by their original (pre-xwayland-satellite-resolved) PID.
+    let boosted_paths: Arc<Mutex<HashMap<i32, PathBuf>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    ctrlc::set_handler(move || {
-        let focused_path = match cleanup_focused_dmem_low_path.lock() {
-            Ok(path) => path.clone(),
-            Err(error) => {
-                eprintln!("WARNING: Failed to lock focused dmem.low path during cleanup: {error}");
-                std::process::exit(1);
+    {
+        let boosted_paths = Arc::clone(&boosted_paths);
+        let cleanup_non_boosted_limits = non_boosted_limits.clone();
+
+        ctrlc::set_handler(move || {
+            let paths = match boosted_paths.lock() {
+                Ok(paths) => paths.clone(),
+                Err(error) => {
+                    eprintln!("WARNING: Failed to lock boosted paths during cleanup: {error}");
+                    std::process::exit(1);
+                }
+            };
+
+            for path in paths.values() {
+                if let Err(error) = set_dmem_low(path, &cleanup_non_boosted_limits) {
+                    eprintln!("WARNING: Failed to cleanup dmem.low at {}: {error}", path.display());
+                }
             }
-        };
 
-        if let Some(path) = focused_path.as_ref()
-            && let Err(error) = set_dmem_low(path, &cleanup_non_boosted_limits)
-        {
-            eprintln!("WARNING: Failed to cleanup dmem.low at {}: {error}", path.display());
-            std::process::exit(1);
-        }
+            std::process::exit(0);
+        })?;
+    }
 
-        std::process::exit(0);
-    })?;
-
-    let mut focused_dmem_low_path: Option<PathBuf> = None;
-    let mut windows = WindowsState::default();
+    let mut state = EventStreamState::default();
+    // Caches PID -> resolved dmem.low path (or None if resolution failed), so we don't hit
+    // xwayland-satellite/D-Bus again for a window we've already resolved.
+    let mut pid_path_cache: HashMap<i32, Option<PathBuf>> = HashMap::new();
 
     let mut read_event = event_socket.read_events();
     while let Ok(event) = read_event() {
-        windows.apply(event.clone());
+        state.apply(event);
 
-        let resolve_dmem_path = |pid| {
-            let pid = find_real_pid(pid)?;
+        let target_pids = compute_boost_pids(&state, &exclusions);
 
-            match dmem_low_path_for_pid(&conn, pid) {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    eprintln!("WARNING: Failed to resolve cgroup for PID {pid}: {error}");
-                    None
-                }
+        // Drop stale cache entries for windows that are no longer targets (closed, unfullscreened,
+        // or newly excluded).
+        pid_path_cache.retain(|pid, _| target_pids.contains(pid));
+
+        let mut target_paths: HashMap<i32, PathBuf> = HashMap::new();
+        for pid in &target_pids {
+            let resolved = pid_path_cache.entry(*pid).or_insert_with(|| {
+                find_real_pid(*pid).and_then(|real_pid| {
+                    match dmem_low_path_for_pid(&conn, real_pid) {
+                        Ok(path) => Some(path),
+                        Err(error) => {
+                            eprintln!("WARNING: Failed to resolve cgroup for PID {real_pid}: {error}");
+                            None
+                        }
+                    }
+                })
+            });
+
+            if let Some(path) = resolved {
+                target_paths.insert(*pid, path.clone());
+            }
+        }
+
+        let mut boosted = match boosted_paths.lock() {
+            Ok(boosted) => boosted,
+            Err(error) => {
+                eprintln!("WARNING: Failed to lock boosted paths: {error}");
+                continue;
             }
         };
 
-        let new_focused_path = match event {
-            Event::WindowFocusChanged { id } => id
-                .and_then(|window_id| windows.windows.get(&window_id))
-                .and_then(|window| window.pid)
-                .and_then(resolve_dmem_path),
-            Event::WindowOpenedOrChanged { window } => {
-                if !window.is_focused {
-                    continue;
-                }
-
-                window.pid.and_then(resolve_dmem_path)
+        // Un-boost anything that's no longer a target.
+        boosted.retain(|pid, path| {
+            if target_paths.contains_key(pid) {
+                return true;
             }
-            Event::WindowsChanged { .. } => windows
-                .windows
-                .values()
-                .find(|window| window.is_focused)
-                .and_then(|window| window.pid)
-                .and_then(resolve_dmem_path),
-            _ => continue,
-        };
 
-        if focused_dmem_low_path == new_focused_path {
-            continue;
-        }
+            if let Err(error) = set_dmem_low(path, &non_boosted_limits) {
+                eprintln!(
+                    "WARNING: Failed to set non-boosted dmem.low at {}: {error}",
+                    path.display()
+                );
+            }
 
-        if let Some(previous_path) = focused_dmem_low_path.as_ref()
-            && let Err(error) = set_dmem_low(previous_path, &non_boosted_limits)
-        {
-            eprintln!(
-                "WARNING: Failed to set non-focused dmem.low at {}: {error}",
-                previous_path.display()
-            );
-        }
+            false
+        });
 
-        if let Some(current_path) = new_focused_path.as_ref()
-            && let Err(error) = set_dmem_low(current_path, &boosted_limits)
-        {
-            eprintln!(
-                "WARNING: Failed to set focused dmem.low at {}: {error}",
-                current_path.display()
-            );
-            focused_dmem_low_path = None;
-            continue;
-        }
+        // Boost any new targets.
+        for (pid, path) in &target_paths {
+            if boosted.contains_key(pid) {
+                continue;
+            }
 
-        focused_dmem_low_path = new_focused_path;
-        if let Ok(mut path) = focused_dmem_low_path_for_cleanup.lock() {
-            *path = focused_dmem_low_path.clone();
+            if let Err(error) = set_dmem_low(path, &boosted_limits) {
+                eprintln!("WARNING: Failed to set boosted dmem.low at {}: {error}", path.display());
+                continue;
+            }
+
+            boosted.insert(*pid, path.clone());
         }
     }
 

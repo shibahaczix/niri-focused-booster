@@ -9,5 +9,8 @@ niri-ipc = "=26.4.0"
 xcb = { version = "1.7.0", features = ["res"] }
 zbus = "5.14.0"
 
+[patch.crates-io]
+niri-ipc = { path = "./niri/niri-ipc" }
+
 [profile.release]
 lto = "thin"
