@@ -1,0 +1,91 @@
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index dfbe59a0..9ecc0c16 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -1358,6 +1358,14 @@ pub struct Window {
+     pub is_floating: bool,
+     /// Whether this window requests your attention.
+     pub is_urgent: bool,
++    /// Whether this window is currently fullscreen.
++    ///
++    /// This reflects real (Wayland-protocol) fullscreen, i.e. the toplevel has the
++    /// `xdg_toplevel::State::Fullscreen` state set. It does not report `true` for "windowed"
++    /// (fake) fullscreen (see the `toggle-windowed-fullscreen` action), since that keeps the
++    /// window as a regular tile from niri's own layout point of view; the underlying client
++    /// still believes itself to be fullscreen in that case.
++    pub is_fullscreen: bool,
+     /// Position- and size-related properties of the window.
+     pub layout: WindowLayout,
+     /// Timestamp when the window was most recently focused.
+diff --git a/src/ipc/client.rs b/src/ipc/client.rs
+index 78022ed9..93053986 100644
+--- a/src/ipc/client.rs
++++ b/src/ipc/client.rs
+@@ -725,6 +725,11 @@ fn print_window(window: &Window) {
+         if window.is_floating { "yes" } else { "no" }
+     );
+ 
++    println!(
++        "  Is fullscreen: {}",
++        if window.is_fullscreen { "yes" } else { "no" }
++    );
++
+     if let Some(pid) = window.pid {
+         println!("  PID: {pid}");
+     } else {
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index 374216c2..9eb83e9c 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -518,6 +518,12 @@ fn make_ipc_window(
+     workspace_id: Option<WorkspaceId>,
+     layout: WindowLayout,
+ ) -> niri_ipc::Window {
++    // Computed *before* entering the with_toplevel_role() closure below: it locks the surface's
++    // toplevel role data for its whole duration via with_states(), and is_fullscreen() (via
++    // sizing_mode() -> with_committed_state()) takes that same per-surface lock again. Calling it
++    // from inside the closure is a same-thread Mutex re-entry, i.e. a guaranteed deadlock.
++    let is_fullscreen = mapped.is_fullscreen();
++
+     with_toplevel_role(mapped.toplevel(), |role| niri_ipc::Window {
+         id: mapped.id().get(),
+         title: role.title.clone(),
+@@ -527,6 +533,7 @@ fn make_ipc_window(
+         is_focused: mapped.is_focused(),
+         is_floating: mapped.is_floating(),
+         is_urgent: mapped.is_urgent(),
++        is_fullscreen,
+         layout,
+         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
+     })
+@@ -719,8 +726,9 @@ impl State {
+             };
+ 
+             let workspace_id = ws_id.map(|id| id.get());
+-            let mut changed =
+-                ipc_win.workspace_id != workspace_id || ipc_win.is_floating != mapped.is_floating();
++            let mut changed = ipc_win.workspace_id != workspace_id
++                || ipc_win.is_floating != mapped.is_floating()
++                || ipc_win.is_fullscreen != mapped.is_fullscreen();
+ 
+             changed |= with_toplevel_role(mapped.toplevel(), |role| {
+                 ipc_win.title != role.title || ipc_win.app_id != role.app_id
+diff --git a/src/window/mapped.rs b/src/window/mapped.rs
+index 3db1f66c..ce4817db 100644
+--- a/src/window/mapped.rs
++++ b/src/window/mapped.rs
+@@ -379,6 +379,14 @@ impl Mapped {
+         self.is_floating
+     }
+ 
++    /// Whether this window is currently (really) fullscreen.
++    ///
++    /// This intentionally does not report `true` for windowed (fake) fullscreen; see
++    /// [`niri_ipc::Window::is_fullscreen`] for the reasoning.
++    pub fn is_fullscreen(&self) -> bool {
++        self.sizing_mode().is_fullscreen()
++    }
++
+     pub fn is_window_cast_target(&self) -> bool {
+         self.is_window_cast_target
+     }
