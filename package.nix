@@ -8,7 +8,10 @@ rustPlatform.buildRustPackage {
   pname = "niri-focused-booster";
   version = "0.3.0";
 
-  src = lib.cleanSource ./.;
+  src = builtins.path {
+    path = ./.;
+    name = "niri-focused-booster-source";
+  };
 
   cargoLock = {
     lockFile = ./Cargo.lock;
