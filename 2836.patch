@@ -72,7 +72,7 @@ index 78022ed..966871b 100644
                          id,
                          focus_timestamp,
 diff --git a/src/ipc/server.rs b/src/ipc/server.rs
-index 374216c..7edf939 100644
+index 374216c..73de4ab 100644
 --- a/src/ipc/server.rs
 +++ b/src/ipc/server.rs
 @@ -34,6 +34,7 @@ use crate::backend::IpcOutputMap;
@@ -83,15 +83,26 @@ index 374216c..7edf939 100644
  use crate::niri::State;
  use crate::utils::{version, with_toplevel_role};
  use crate::window::Mapped;
-@@ -526,6 +527,7 @@ fn make_ipc_window(
+@@ -518,6 +519,10 @@ fn make_ipc_window(
+     workspace_id: Option<WorkspaceId>,
+     layout: WindowLayout,
+ ) -> niri_ipc::Window {
++    // Must be computed outside of `with_toplevel_role()`: `sizing_mode()` locks the same
++    // toplevel role mutex, so calling it inside the closure would deadlock the compositor.
++    let fullscreen_state = mapped.sizing_mode().into();
++
+     with_toplevel_role(mapped.toplevel(), |role| niri_ipc::Window {
+         id: mapped.id().get(),
+         title: role.title.clone(),
+@@ -526,6 +531,7 @@ fn make_ipc_window(
          workspace_id: workspace_id.map(|id| id.get()),
          is_focused: mapped.is_focused(),
          is_floating: mapped.is_floating(),
-+        fullscreen_state: mapped.sizing_mode().into(),
++        fullscreen_state,
          is_urgent: mapped.is_urgent(),
          layout,
          focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
-@@ -740,6 +742,13 @@ impl State {
+@@ -740,6 +746,13 @@ impl State {
                  events.push(Event::WindowFocusChanged { id: Some(id) });
              }
  
