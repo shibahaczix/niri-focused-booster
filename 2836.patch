@@ -1,0 +1,139 @@
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index dfbe59a..8b2c4fb 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -1352,6 +1352,12 @@ pub struct Window {
+     ///
+     /// There can be either one focused window or zero (e.g. when a layer-shell surface has focus).
+     pub is_focused: bool,
++    /// The fullscreen state of this window.
++    ///
++    /// - `0`: not fullscreen (tiled or floating)
++    /// - `1`: maximized
++    /// - `2`: fullscreen
++    pub fullscreen_state: u8,
+     /// Whether this window is currently floating.
+     ///
+     /// If the window isn't floating then it is in the tiling layout.
+@@ -1672,6 +1678,16 @@ pub enum Event {
+         /// Id of the newly focused window, or `None` if no window is now focused.
+         id: Option<u64>,
+     },
++    /// A window's fullscreen state was changed changed.
++    WindowFullscreenStateChanged {
++        /// Id of the window.
++        id: u64,
++        /// Fullscreen state for the window
++        /// - `0`: not fullscreen (tiled or floating)
++        /// - `1`: maximized
++        /// - `2`: fullscreen
++        fullscreen_state: u8,
++    },
+     /// Window focus timestamp changed.
+     ///
+     /// This event is separate from [`Event::WindowFocusChanged`] because the focus timestamp only
+diff --git a/niri-ipc/src/state.rs b/niri-ipc/src/state.rs
+index b603dfc..ffe11a8 100644
+--- a/niri-ipc/src/state.rs
++++ b/niri-ipc/src/state.rs
+@@ -231,6 +231,17 @@ impl EventStreamStatePart for WindowsState {
+                     win.layout = update;
+                 }
+             }
++            Event::WindowFullscreenStateChanged {
++                id,
++                fullscreen_state,
++            } => {
++                for win in self.windows.values_mut() {
++                    if win.id == id {
++                        win.fullscreen_state = fullscreen_state;
++                        break;
++                    }
++                }
++            }
+             event => return Some(event),
+         }
+         None
+diff --git a/src/ipc/client.rs b/src/ipc/client.rs
+index 78022ed..966871b 100644
+--- a/src/ipc/client.rs
++++ b/src/ipc/client.rs
+@@ -475,6 +475,12 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
+                     Event::WindowFocusChanged { id } => {
+                         println!("Window focus changed: {id:?}");
+                     }
++                    Event::WindowFullscreenStateChanged {
++                        id,
++                        fullscreen_state,
++                    } => {
++                        println!("Window {id}: fullscreen state changed to {fullscreen_state}");
++                    }
+                     Event::WindowFocusTimestampChanged {
+                         id,
+                         focus_timestamp,
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index 374216c..7edf939 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -34,6 +34,7 @@ use crate::backend::IpcOutputMap;
+ use crate::handlers::image_copy_capture;
+ use crate::input::pick_window_grab::PickWindowGrab;
+ use crate::layout::workspace::WorkspaceId;
++use crate::layout::LayoutElement;
+ use crate::niri::State;
+ use crate::utils::{version, with_toplevel_role};
+ use crate::window::Mapped;
+@@ -526,6 +527,7 @@ fn make_ipc_window(
+         workspace_id: workspace_id.map(|id| id.get()),
+         is_focused: mapped.is_focused(),
+         is_floating: mapped.is_floating(),
++        fullscreen_state: mapped.sizing_mode().into(),
+         is_urgent: mapped.is_urgent(),
+         layout,
+         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
+@@ -740,6 +742,13 @@ impl State {
+                 events.push(Event::WindowFocusChanged { id: Some(id) });
+             }
+ 
++            if mapped.sizing_mode() != ipc_win.fullscreen_state.into() {
++                events.push(Event::WindowFullscreenStateChanged {
++                    id,
++                    fullscreen_state: mapped.sizing_mode().into(),
++                });
++            }
++
+             let focus_timestamp = mapped.get_focus_timestamp().map(Timestamp::from);
+             if focus_timestamp != ipc_win.focus_timestamp {
+                 events.push(Event::WindowFocusTimestampChanged {
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 97f917a..cbedcd8 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -590,6 +590,27 @@ impl SizingMode {
+     }
+ }
+ 
++impl From<u8> for SizingMode {
++    fn from(value: u8) -> Self {
++        match value {
++            0 => Self::Normal,
++            1 => Self::Maximized,
++            2 => Self::Fullscreen,
++            _ => Self::Normal,
++        }
++    }
++}
++
++impl From<SizingMode> for u8 {
++    fn from(value: SizingMode) -> Self {
++        match value {
++            SizingMode::Normal => 0,
++            SizingMode::Maximized => 1,
++            SizingMode::Fullscreen => 2,
++        }
++    }
++}
++
+ impl<W: LayoutElement> InteractiveMoveState<W> {
+     fn moving(&self) -> Option<&InteractiveMoveData<W>> {
+         match self {

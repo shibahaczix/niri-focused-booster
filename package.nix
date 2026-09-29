@@ -39,7 +39,7 @@ in rustPlatform.buildRustPackage {
     chmod -R u+w ./niri
 
     cd ./niri
-    patch -p1 < ../niri-expose-is-fullscreen-ipc.patch
+    patch -p1 < ../2836.patch
     cd ..
   '';
 

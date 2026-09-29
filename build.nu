@@ -1,7 +1,7 @@
 #!/usr/bin/env nu
 
 let niri_dir = "./niri"
-let patch_file = "./niri-expose-is-fullscreen-ipc.patch"
+let patch_file = "./2836.patch"
 let niri_repo = "https://github.com/YaLTeR/niri.git"
 
 if not ($patch_file | path exists) {

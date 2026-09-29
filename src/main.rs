@@ -14,6 +14,10 @@ use std::sync::{Arc, Mutex};
 use x11::*;
 use zbus::blocking::Connection;
 
+/// Value of `Window::fullscreen_state` for a truly fullscreen window
+/// (0 = normal, 1 = maximized, 2 = fullscreen).
+const FULLSCREEN: u8 = 2;
+
 /// Reads excluded app IDs from `NIRI_FOCUSED_BOOSTER_EXCLUDE` (comma-separated) and/or CLI args
 /// (also comma-separated, can be repeated). Matching is a case-insensitive substring match
 /// against the window's `app_id`, so e.g. "steam" also matches "steam_app_12345".
@@ -46,7 +50,7 @@ fn compute_boost_pids(state: &EventStreamState, exclusions: &[String]) -> HashSe
         .windows
         .windows
         .values()
-        .filter(|window: &&Window| window.is_fullscreen)
+        .filter(|window: &&Window| window.fullscreen_state == FULLSCREEN)
         .filter(|window| !is_excluded(window.app_id.as_deref(), exclusions))
         .filter_map(|window| window.pid)
         .collect()
